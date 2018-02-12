@@ -49,57 +49,76 @@ If multiple endpoints satisfy the "hard" or "soft" topology requirement, we will
 
 ### API changes
 
-#### Service API changes
+#### New type ServicePolicy
 
-As with scheduling topology, there are currently two types of topology, called `Required` and `Preferred` which denote “hard” vs. “soft” requirements. 
+The user need a way to decalre which service is "local service" and what is the "topology key" of "local service".
 
-Similarly, we introduce a topology mode and an associated topology key in service topology.
+This will be accomplished through a new type object `ServicePolicy`.
+Endpoint(s) with specify label will be selected by label selector in
+`ServicePolicy`, and `ServicePolicy` will declare the topology policy for those endpoints.
+
+`ServicePolicy` will inside a unique namespace, and a single namespace
+can own multiple `ServicePoligy`s.
 
 ```go
-type Service struct {
-  Spec:
-    // topology is used to achieve "local" service in a given topology level.
-    // User can control what ever topology level they want.
-    // +optional
-    Topology ServiceTopology `json:"topology" protobuf:"bytes,1,opt,name=topology"`
+type ServicePolicy struct {
+  TypeMeta
+  ObjectMeta
+
+  // specification of the topology policy of this ServicePolicy
+  Spec TopologyPolicySpec
+}
+
+type TopologyPolicySpec struct {
+  // ServiceSelector select the service to which this TopologyPolicy object applies.
+  // One service only can be selected by single ServicePolicy, in this case, the topology rules are combined additively.
+  // This field is NOT optional an empty ServiceSelector will result in err.
+  ServiceSelector metav1.LabelSelector `json:"endPointSelector" protobuf:"bytes,1,opt,name=podSelector"`
+
+  // topology is used to achieve "local" service in a given topology level.
+  // User can control what ever topology level they want.
+  // +optional
+  Topology ServiceTopology `json:"topology" protobuf:"bytes,1,opt,name=topology"`
 }
 
 // Defines a service topolgoy information.
 type ServiceTopology struct {
-    // Valid values for mode are "ignored", "required", "preferred".
-    // "ignored" is the default value and the associated topology key will have no effect.
-    // "required" is the "hard" requirement for topology key and an example would be  “only visit service backends in the same zone”. 
-    // If the topology requirements specified by this field are not met, the LB, such as kube-proxy will not pick endpoints for the service.
-    // "preferred" is the "soft" requirement for topology key and an example would be   
-    // "prefer to visit service backends in the same rack, but OK to other racks if none match"
-    // +optional
-    Mode ServicetopologyMode `json:"mode" protobuf:"bytes,1,opt,name=mode"`
-    // key is the key for the node label that the system uses to denote    
-    // such a topology domain. There are some built-in topology keys, e.g. 
-    // kubernetes.io/hostname, failure-domain.beta.kubernetes.io/zone and failure-domain.beta.kubernetes.io/region etc.
-    // The built-in topology keys can be good examples and we recommend users switch to a similar mode for portability, but it's NOT enforced.
-    // Users can define whatever topolgoy key they like since topology is arbitrary.
-    // +optional
-    Key string `json:"key" protobuf:"bytes,2,opt,name=key"`
-}
+  // Valid values for mode are "ignored", "required", "preferred".
+  // "ignored" is the default value and the associated topology key will have no effect.
+  // "required" is the "hard" requirement for topology key and an example would be  “only visit service backends in the same zone”.
+  // If the topology requirements specified by this field are not met, the LB, such as kube-proxy will not pick endpoints for the service.
+  // "preferred" is the "soft" requirement for topology key and an example would be
+  // "prefer to visit service backends in the same rack, but OK to other racks if none match"
+  // +optional
+  Mode ServicetopologyMode `json:"mode" protobuf:"bytes,1,opt,name=mode"`
 
-type ServicetopologyMode string
+  // key is the key for the node label that the system uses to denote
+  // such a topology domain. There are some built-in topology keys, e.g.
+  // kubernetes.io/hostname, failure-domain.beta.kubernetes.io/zone and failure-domain.beta.kubernetes.io/region etc.
+  // The built-in topology keys can be good examples and we recommend users switch to a similar mode for portability, but it's NOT enforced.
+  // Users can define whatever topolgoy key they like since topology is arbitrary.
+  // +optional
+  Key string `json:"key" protobuf:"bytes,2,opt,name=key"`
+}
 ```
 
-An example of service that uses topologyKey:
+An example of `ServicePolicy`:
 
 ```yaml
-apiVersion: v1
-kind: Service
+kind: ServicePolicy
 metadata:
-  name: with-service-topology
+  name: service-policy-example
+  namespace: test
 spec:
+  serviceSelector:
+    matchLabels:
+      app: test
   topology:
     key: kubernetes.io/hostname
     mode: required
 ```
 
-In our example, "same-host" is required and user's request will be routed only to backends in the same host as LB such as kube-proxy.
+In our example,services in namespace "test" with label "app=test" will be selected, user's request to those services will be routed only to backends in the same host.
 
 #### Endpoints API changes
 
@@ -118,16 +137,40 @@ type EndpointAddress struct {
 
 Endpoint Controller will populate the `Topology` for each `EndpointAddress`. We want `EndpointAddress.Topology` to tell the LB, such as kube-proxy what topology domain(e.g. host, rack, zone, region etc.) the endpoints is in.
 
-Endpoints controller will need to watch ALL nodes and maintain a key-value store for node cache - the key is the nodename and value is the node object. So, the new logic of endpoint controller might like:
+Endpoints controller will need to watch ALL nodes and maintain a key-value store for node cache - the key is the nodename and value is the node object. Also, endpoints controller will need to watch ALL ServicePolicy, and maintain a store for service info, which will contains all services' namespacename-labels-topology information.
+
+So, the new logic of endpoint controller might like:
 
 ```go
-go watch service, pod, node
+// serviceInfoMap is the map of service with it's information
+// serviceNaName is service "namespace/name"
+type serviceInfoMap map[serviceNsName]*serviceInfo
+
+// serviceInfo is the service information
+// which is used for maintain ServicePolicy information and update endpoint
+type serviceInfo struct {
+
+  labels map[string]string
+
+  // the topology of unique service, a service can have multiple topology in case
+  // this service is selected by multiple ServicePolicy
+  []topology  ServiceTopology
+}
+go watch service, pod, node, servicePolicy
+
+// update Service topology information
+for servicePolicy := range ServicePolicys; do
+  //find the service match servicePolicy selectors
+  //write service topology info to serviceInfoMap
+done
+
+// sync endpoints
 for i, pod := range service backends; do
   node := nodeCache[pod.Spec.NodeName]
   // Copy all topology-related labels of node hosting endpoint to endpoint
   // We can only include node labels referenced in the service spec's topology constraints
   endpointAddress := &v1.EndpointAddress {}
-  for topologyKey in service.Spec; do
+  for topologyKey in serviceInfo.topology; do
     endpointAddress.Topology[topologyKey] = node.Labels[topologyKey]
   done
   endpoints.Subsets[i].Addresses = endpointAddress
